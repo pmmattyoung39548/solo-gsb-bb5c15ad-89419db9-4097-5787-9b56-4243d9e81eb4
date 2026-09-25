@@ -5,6 +5,8 @@ import {
   parseChapterFile,
   buildImportPreview,
   applyImportedChapters,
+  isImportPreviewCurrent,
+  type ImportPreviewSource,
 } from '../src/utils/importChapters';
 import type { Chapter } from '../src/types';
 
@@ -225,6 +227,56 @@ expectThrow(() => parseChapterFile('   '), 'empty file throws');
     'round-trip preserves timing/title',
   );
   check(new Set(merged.map((c) => c.id)).size === 2, 'imported ids unique');
+}
+
+// ---- 跨音频串档防护：预览来源批次核对 ----
+// App 在章节文件读取完成时记录来源（音频载入批次 + 章节/时长快照），新音频
+// 成功载入时推进批次、作废旧读取并关闭旧预览；应用前再核对一次来源。
+{
+  const source: ImportPreviewSource = {
+    audioBatch: 1,
+    existing: [mk('old', 0, 10, '旧音频章节')],
+    duration: 100,
+  };
+  check(isImportPreviewCurrent(source, 1), 'same audio batch: preview may apply');
+  check(
+    !isImportPreviewCurrent(source, 2),
+    'audio switched (incl. same-name file): stale preview blocked',
+  );
+  check(!isImportPreviewCurrent(null, 1), 'no recorded source: apply blocked');
+  check(!isImportPreviewCurrent(null, 0), 'no source before any load: blocked');
+}
+{
+  // 失配时调用方不得写入：旧音频的章节/时长快照不能覆盖新会话数据
+  // （模拟 App 的守门流程——核对失败则不调用 applyImportedChapters）
+  const parsed = parseJSONChapters(JSON.stringify([{ title: 'A', start: 0, end: 50 }]));
+  const staleSource: ImportPreviewSource = {
+    audioBatch: 1,
+    existing: [mk('old-keep', 60, 70, '旧会话章节')],
+    duration: 100,
+  };
+  const preview = buildImportPreview(parsed, staleSource.existing, staleSource.duration);
+  eq(preview.counts.valid, 1, 'stale preview itself is well-formed');
+  const newSession = [mk('new-keep', 5, 15, '新会话章节')];
+  let written: Chapter[] | null = null;
+  if (isImportPreviewCurrent(staleSource, 2)) {
+    written = applyImportedChapters(preview, staleSource.existing, staleSource.duration);
+  }
+  check(written === null, 'mismatched batch: apply blocked, nothing written');
+  eq(
+    newSession.map((c) => c.id),
+    ['new-keep'],
+    'new session chapters preserved on blocked apply',
+  );
+  // 同批次则正常合并（当前音频的有效预览仍可按勾选项导入）
+  const ok = isImportPreviewCurrent(staleSource, 1)
+    ? applyImportedChapters(preview, staleSource.existing, staleSource.duration)
+    : null;
+  eq(
+    ok?.map((c) => `${c.title}:${c.start}-${c.end}`),
+    ['A:0-50', '旧会话章节:60-70'],
+    'matching batch: preview applies against its own snapshot',
+  );
 }
 
 console.log(failures === 0 ? 'ALL PASS' : `${failures} FAILURES`);

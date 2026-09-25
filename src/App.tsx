@@ -64,8 +64,10 @@ import { buildChapterAudioPack } from './utils/audioPack';
 import {
   applyImportedChapters,
   buildImportPreview,
+  isImportPreviewCurrent,
   parseChapterFile,
   type ImportPreview,
+  type ImportPreviewSource,
   type PreviewEntry,
 } from './utils/importChapters';
 import { formatTime, uid } from './utils/time';
@@ -123,6 +125,8 @@ export default function App() {
   const currentBufferRef = useRef<AudioBuffer | null>(null);
   /** 当前载入任务 token；连续切换时只有最新任务可写波形 */
   const loadTokenRef = useRef(0);
+  /** 音频载入批次：每次成功载入 +1 —— 章节导入预览绑定到具体批次，跨批次即过期 */
+  const audioBatchRef = useRef(0);
 
   // silence-split suggestions
   const [rmsWindows, setRmsWindows] = useState<Float32Array | null>(null);
@@ -159,11 +163,12 @@ export default function App() {
   const [importPreview, setImportPreview] = useState<ImportPreview | null>(null);
   const [importFileName, setImportFileName] = useState('');
   const [importError, setImportError] = useState<string | null>(null);
-  // 每次选文件自增，避免快速连选两个文件时先返回的旧解析覆盖新预览
+  // 每次选文件自增，避免快速连选两个文件时先返回的旧解析覆盖新预览；
+  // 音频成功载入时同样自增，作废切换前开始的读取（含同名文件切换）
   const importTokenRef = useRef(0);
-  // 应用时按此快照合并，保证“预览所见即应用所得”，失败不写任何内容
-  const previewExistingRef = useRef<Chapter[]>([]);
-  const previewDurationRef = useRef(0);
+  // 预览来源：构建预览时的音频载入批次 + 现有章节与时长快照。应用前核对
+  // 批次、按快照合并，保证“预览所见即应用所得”，失配 / 失败不写任何内容
+  const previewSourceRef = useRef<ImportPreviewSource | null>(null);
 
   // ---- 本地 WebVTT 逐字稿覆盖核对（字幕不导入为章节，仅统计时间交集）----
   const transcriptFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -401,6 +406,19 @@ export default function App() {
         const buffer = await engine.decode(file);
         if (token !== loadTokenRef.current) return; // 已被更新的选择取代
         resetChapters();
+        // 新音频成功载入 = 新载入批次：作废切换前开始的章节文件读取、关闭
+        // 旧预览并清空其来源快照（同名文件切换也走到这里，不依赖 fileName
+        // 变化）；应用前还会按批次再核对一次预览来源
+        audioBatchRef.current += 1;
+        importTokenRef.current += 1;
+        previewSourceRef.current = null;
+        setImportPreview(null);
+        setImportError(null);
+        setImportFileName('');
+        // 逐字稿同样绑定旧音频：作废进行中的读取并清空已载入内容
+        transcriptTokenRef.current += 1;
+        setTranscript(null);
+        setTranscriptError(null);
         previewRef.current = null;
         // 载入新音频：停止试听并把播放源归属切回新文件的原始缓冲
         //（decode 已重置 engine 的播放缓冲，这里同步界面试听状态）
@@ -473,6 +491,7 @@ export default function App() {
   // ---- 本地章节文件导入（本工具导出的 JSON / 标准 WebVTT）----
   const closeImportDialog = useCallback(() => {
     importTokenRef.current += 1; // discard any in-flight file read
+    previewSourceRef.current = null;
     setImportPreview(null);
     setImportError(null);
     setImportFileName('');
@@ -486,15 +505,19 @@ export default function App() {
     setImportFileName(f.name);
     setImportError(null);
     setImportPreview(null);
+    previewSourceRef.current = null;
     f.text()
       .then((text) => {
-        if (token !== importTokenRef.current) return; // a newer file was chosen
+        if (token !== importTokenRef.current) return; // 已选更新文件，或音频已切换
         const parsed = parseChapterFile(text);
-        // snapshot the validation context so apply matches the preview even
-        // if chapters change while the dialog is open
-        previewExistingRef.current = chaptersApi.sortedChapters;
-        previewDurationRef.current = duration;
-        setImportPreview(buildImportPreview(parsed, previewExistingRef.current, duration));
+        // 记录预览来源（当前音频载入批次 + 现有章节与时长快照）：应用前
+        // 核对批次、按快照合并，保证“预览所见即应用所得”
+        previewSourceRef.current = {
+          audioBatch: audioBatchRef.current,
+          existing: chaptersApi.sortedChapters,
+          duration,
+        };
+        setImportPreview(buildImportPreview(parsed, chaptersApi.sortedChapters, duration));
       })
       .catch((err: unknown) => {
         if (token !== importTokenRef.current) return;
@@ -505,13 +528,25 @@ export default function App() {
   const applyImport = useCallback(
     (entries: PreviewEntry[]) => {
       if (!importPreview) return;
+      const source = previewSourceRef.current;
+      // 应用前核对预览来源：预览必须绑定当前音频载入批次。切换音频（含
+      // 同名文件）后旧预览失配 —— 阻止写入并提示，新会话已有章节保留
+      if (!isImportPreviewCurrent(source, audioBatchRef.current)) {
+        showNotice(
+          '导入预览已过期：音频已切换，未写入任何章节。请重新选择章节文件。',
+          'import:stale',
+          4000,
+        );
+        closeImportDialog();
+        return;
+      }
       try {
         // build the full next list up-front; the final guard throws on any
         // overlap/out-of-range so replaceAll never performs a partial write
         const next = applyImportedChapters(
           importPreview,
-          previewExistingRef.current,
-          previewDurationRef.current,
+          source.existing,
+          source.duration,
           new Set(entries.map((e) => e.row)),
         );
         chaptersApi.replaceAll(next);
@@ -523,17 +558,6 @@ export default function App() {
     },
     [importPreview, chaptersApi, showNotice, closeImportDialog],
   );
-
-  // a new audio file invalidates any open import preview AND the loaded
-  // transcript: cues clipped against the old duration never carry over
-  useEffect(() => {
-    previewExistingRef.current = [];
-    setImportPreview(null);
-    setImportError(null);
-    transcriptTokenRef.current += 1;
-    setTranscript(null);
-    setTranscriptError(null);
-  }, [fileName]);
 
   // ---- 逐字稿：读取本地 WebVTT 并按当前时长裁剪；不会产生任何章节 ----
   const onTranscriptFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {

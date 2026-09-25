@@ -45,6 +45,32 @@ export interface PreviewEntry extends ImportCandidate {
   reasons: string[];
 }
 
+/**
+ * 预览来源：构建导入预览那一刻的音频载入批次，以及现有章节与音频时长的
+ * 快照。读取完成时由调用方记录；载入批次由音频载入方维护（每次成功载入
+ * +1，同名文件切换同样推进）。
+ */
+export interface ImportPreviewSource {
+  /** 构建预览时的音频载入批次 */
+  audioBatch: number;
+  /** 构建预览时的现有章节快照（应用时按此合并，预览所见即应用所得） */
+  existing: Chapter[];
+  /** 构建预览时的音频时长（应用时按此校验越界） */
+  duration: number;
+}
+
+/**
+ * 应用前核对预览来源：只有预览构建时的音频载入批次与当前批次一致才允许
+ * 写入。切换音频（含同名文件）后旧预览一律失配——调用方必须阻止写入，
+ * 以保留新音频会话已有的章节。
+ */
+export function isImportPreviewCurrent(
+  source: ImportPreviewSource | null,
+  currentAudioBatch: number,
+): source is ImportPreviewSource {
+  return source !== null && source.audioBatch === currentAudioBatch;
+}
+
 const EPS = 1e-6;
 
 /**
