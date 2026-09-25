@@ -91,7 +91,7 @@ export function ImportDialog(props: ImportDialogProps) {
         <div className="imp-sub">
           {parseError ? (
             <span className="imp-error-text">
-              「{props.fileName}」无法解析：{parseError}
+              「{props.fileName}」：{parseError}
             </span>
           ) : (
             preview && (

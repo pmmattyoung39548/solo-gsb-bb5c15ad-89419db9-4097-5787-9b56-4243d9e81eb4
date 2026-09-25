@@ -6,6 +6,7 @@ import {
   buildImportPreview,
   applyImportedChapters,
 } from '../src/utils/importChapters';
+import { ImportPreviewSession } from '../src/utils/importPreviewSession';
 import type { Chapter } from '../src/types';
 
 let failures = 0;
@@ -225,6 +226,57 @@ expectThrow(() => parseChapterFile('   '), 'empty file throws');
     'round-trip preserves timing/title',
   );
   check(new Set(merged.map((c) => c.id)).size === 2, 'imported ids unique');
+}
+
+// ---- 预览绑定音频载入批次（跨音频串档防护，含新旧音频同名场景）----
+{
+  const s = new ImportPreviewSession();
+  // 首段音频成功载入 → 进入载入批次 1
+  s.audioLoaded();
+  const firstSession = s.session;
+
+  // 选择章节文件 → 读取完成 → 预览绑定到当前批次，允许应用
+  const t1 = s.beginRead();
+  check(s.isCurrent(t1), 'session: 同批次内读取完成仍有效');
+  s.bindPreview(t1);
+  check(s.canApply(), 'session: 当前音频的有效预览允许应用');
+
+  // 读取尚未完成就切换音频（新旧同名也走同一条 audioLoaded 路径）：
+  // 旧读取作废、旧预览解绑，迟到的旧读取不得回填
+  const t2 = s.beginRead();
+  s.audioLoaded();
+  check(s.session !== firstSession, 'session: 成功载入新音频即进入新批次（与文件名无关）');
+  check(!s.isCurrent(t2), 'session: 切换音频后进行中的旧读取作废，不得回填预览');
+  check(!s.canApply(), 'session: 切换音频后旧预览禁止应用（保留新音频已有章节）');
+
+  // 预览已打开时切换音频：应用前核对来源失配 → 阻止写入
+  const t3 = s.beginRead();
+  s.bindPreview(t3);
+  check(s.canApply(), 'session: 第二段音频的预览允许应用');
+  s.audioLoaded(); // 又换音频（可同名）
+  check(!s.canApply(), 'session: 预览已打开时换音频，应用前核对失配并阻止写入');
+
+  // 新音频下重新选择章节文件：预览正常绑定、正常应用
+  const t4 = s.beginRead();
+  check(s.isCurrent(t4), 'session: 新批次内的新读取有效');
+  s.bindPreview(t4);
+  check(s.canApply(), 'session: 新音频的有效预览恢复可应用');
+
+  // 同一批次内连续选两个文件：只认最新一次读取
+  const t5 = s.beginRead();
+  const t6 = s.beginRead();
+  check(!s.isCurrent(t5) && s.isCurrent(t6), 'session: 连续选择文件只认最新读取');
+  check(!s.canApply(), 'session: 重新选择文件后旧预览绑定一并解除');
+
+  // 关闭预览（取消 / 应用完成）：进行中的读取作废、绑定解除
+  s.bindPreview(t6);
+  s.close();
+  check(!s.isCurrent(t6) && !s.canApply(), 'session: 关闭预览作废旧读取并解除绑定');
+
+  // 解码失败 / 未发生新载入：已打开的预览保持有效（当前音频没变）
+  const t7 = s.beginRead();
+  s.bindPreview(t7);
+  check(s.canApply(), 'session: 未发生新载入时预览保持有效');
 }
 
 console.log(failures === 0 ? 'ALL PASS' : `${failures} FAILURES`);
